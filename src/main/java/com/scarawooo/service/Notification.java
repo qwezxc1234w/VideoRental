@@ -1,0 +1,8 @@
+package com.scarawooo.service;
+
+public enum Notification {
+    AUTHORIZATION, REGISTRATION, DISCONNECT,
+    RESERVE, UNRESERVE, SUCCESSFULLY,
+    UNSUCCESSFULLY, AGREE, DISAGREE, NOTHING,
+    GET_GOODS, GET_RESERVES
+}
