@@ -31,4 +31,8 @@ public class SessionProvider {
         }
         return sessionFactory.openSession();
     }
+
+    public static void shutdown() {
+        sessionFactory.close();
+    }
 }

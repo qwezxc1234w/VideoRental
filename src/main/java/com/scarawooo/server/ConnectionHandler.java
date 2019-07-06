@@ -1,17 +1,19 @@
 package com.scarawooo.server;
 
-import com.scarawooo.dao.ClientDAO;
-import com.scarawooo.dao.ReserveUnitDAO;
-import com.scarawooo.dao.WarehouseUnitDAO;
+import com.scarawooo.dao.implementations.ClientDAOImpl;
+import com.scarawooo.dao.implementations.ReserveUnitDAOImpl;
+import com.scarawooo.dao.implementations.WarehouseUnitDAOImpl;
 import com.scarawooo.dto.ClientDTO;
 import com.scarawooo.dto.ReserveUnitDTO;
 import com.scarawooo.dto.WarehouseUnitDTO;
+import com.scarawooo.hibernate.SessionProvider;
 import com.scarawooo.service.Notification;
 import javafx.util.Pair;
 
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.ref.Cleaner;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -60,13 +62,22 @@ public class ConnectionHandler extends Thread {
                     i.shutdown();
             }
             synchronized (tokens) {
-                for (Token token : tokens)
-                    if (token.isValid())
-                        token.enableAutoFlushing();
-                    else
-                        WarehouseUnitDAO.update(token.getWarehouseUnit());
+                WarehouseUnitDAOImpl warehouseUnitDAO = new WarehouseUnitDAOImpl();
+                if (!tokens.isEmpty()) {
+                    boolean shutdownSessionProviderByToken = false;
+                    for (Token token : tokens)
+                        if (token.isValid()) {
+                            shutdownSessionProviderByToken = true;
+                            token.enableAutoFlushing();
+                        }
+                        else
+                            warehouseUnitDAO.update(token.getWarehouseUnit());
+                    if (!shutdownSessionProviderByToken)
+                        SessionProvider.shutdown();
+                }
+                else
+                    SessionProvider.shutdown();
             }
-            // потушить hibernate потоки
             System.out.println("> Сервер остановлен");
         }
     }
@@ -104,7 +115,7 @@ public class ConnectionHandler extends Thread {
             synchronized (tokens) {
                 for (int i = 0; i < tokens.size() && !Thread.interrupted(); ++i) {
                     if (!tokens.get(i).isValid()) {
-                        WarehouseUnitDAO.update(tokens.get(i).getWarehouseUnit());
+                        new WarehouseUnitDAOImpl().update(tokens.get(i).getWarehouseUnit());
                         tokens.remove(i--);
                     }
                 }
@@ -131,8 +142,7 @@ public class ConnectionHandler extends Thread {
                     System.out.println("> Клиент: " + socket + " Запрос: " + request);
                     switch (request) {
                         case AUTHORIZATION:
-                            ClientDTO tmp = (ClientDTO) socketObjectReader.readObject();
-                            clientDTO = (reply = auth(tmp)) == Notification.SUCCESSFULLY ? ClientDAO.getByLoginAndPass(tmp) : null;
+                            reply = auth((ClientDTO) socketObjectReader.readObject());
                             socketObjectWriter.writeObject(reply);
                             System.out.println("> Ответ: " + reply);
                             break;
@@ -143,55 +153,83 @@ public class ConnectionHandler extends Thread {
                             break;
                         case RESERVE:
                             boolean reserveBarrier = false;
-                            List reserves = (List) socketObjectReader.readObject();
-                            ArrayList<Pair<Token, Integer>> factReservesAmount = reserve(reserves);
+                            ArrayList<Pair<Token, Integer>> factReservesAmount = null;
                             try {
-                                socketObjectWriter.writeObject(factReservesAmount);
-                                System.out.println("> Уточняем детали бронирования");
-                                if (socketObjectReader.readObject() == Notification.AGREE) {
-                                    System.out.println("> Клиент " + socket + " подтвердил бронирование");
-                                    reserveBarrier = true;
-                                    try {
-                                        for (int i = 0; i < reserves.size(); ++i) {
-                                            ((ReserveUnitDTO) reserves.get(i)).setClient(clientDTO);
-                                            ((ReserveUnitDTO) reserves.get(i)).setAmount(factReservesAmount.get(i).getValue());
-                                            ReserveUnitDAO.insert(((ReserveUnitDTO) reserves.get(i)));
+                                if (clientDTO == null) {
+                                    socketObjectWriter.writeObject(Notification.UNAUTHORIZED);
+                                    System.out.println("> Клиент " + socket + " не авторизован");
+                                }
+                                else {
+                                    socketObjectWriter.writeObject(Notification.DEFAULT);
+                                    List reserves = (List) socketObjectReader.readObject();
+                                    factReservesAmount = reserve(reserves);
+                                    socketObjectWriter.writeObject(factReservesAmount);
+                                    System.out.println("> Уточняем детали бронирования");
+                                    if (socketObjectReader.readObject() == Notification.AGREE) {
+                                        System.out.println("> Клиент " + socket + " подтвердил бронирование");
+                                        reserveBarrier = true;
+                                        try {
+                                            for (int i = 0; i < reserves.size(); ++i) {
+                                                ((ReserveUnitDTO) reserves.get(i)).setClient(clientDTO);
+                                                ((ReserveUnitDTO) reserves.get(i)).setAmount(factReservesAmount.get(i).getValue());
+                                                new ReserveUnitDAOImpl().insert(((ReserveUnitDTO) reserves.get(i)));
+                                            }
+                                            reply = Notification.SUCCESSFULLY;
+                                        } catch (Throwable exception) {
+                                            exception.printStackTrace();
+                                            cancelReserve(factReservesAmount);
+                                            reply = Notification.UNSUCCESSFULLY;
                                         }
-                                        reply = Notification.SUCCESSFULLY;
-                                    } catch (Throwable exception) {
-                                        exception.printStackTrace();
+                                        socketObjectWriter.writeObject(reply);
+                                        System.out.println("> Ответ: " + reply);
+                                    } else {
+                                        System.out.println("> Клиент " + socket + " отказался от бронирования. Отмена бронирования");
                                         cancelReserve(factReservesAmount);
-                                        reply = Notification.UNSUCCESSFULLY;
                                     }
-                                    socketObjectWriter.writeObject(reply);
-                                    System.out.println("> Ответ: " + reply);
-                                } else {
-                                    System.out.println("> Клиент " + socket + " отказался от бронирования. Отмена бронирования");
-                                    cancelReserve(factReservesAmount);
                                 }
                             }
                             catch (IOException | ClassNotFoundException | ClassCastException exception) {
                                 if (!reserveBarrier) {
                                     System.err.println("> Соединение с клиентом " + socket + " потеряно. Отмена бронирования");
-                                    cancelReserve(factReservesAmount);
+                                    if (factReservesAmount != null)
+                                        cancelReserve(factReservesAmount);
                                 }
                                 throw exception;
                             }
                             finally {
-                                for (Pair<Token, Integer> i : factReservesAmount)
-                                    i.getKey().decrementUsingCounter();
+                                if (factReservesAmount != null)
+                                    for (Pair<Token, Integer> i : factReservesAmount)
+                                        i.getKey().decrementUsingCounter();
                             }
                             break;
                         case UNRESERVE:
-                            reply = unreserve((ReserveUnitDTO) socketObjectReader.readObject()) ? Notification.SUCCESSFULLY : Notification.UNSUCCESSFULLY;
-                            socketObjectWriter.writeObject(reply);
-                            System.out.println("> Ответ: " + reply);
+                            if (clientDTO == null) {
+                                socketObjectWriter.writeObject(Notification.UNAUTHORIZED);
+                                System.out.println("> Клиент " + socket + " не авторизован");
+                            }
+                            else {
+                                socketObjectWriter.writeObject(Notification.DEFAULT);
+                                ReserveUnitDTO reserveUnitDTO = (ReserveUnitDTO) socketObjectReader.readObject();
+                                if (reserveUnitDTO.getClient().getId() == clientDTO.getId())
+                                    reply = unreserve(reserveUnitDTO) ? Notification.SUCCESSFULLY : Notification.UNSUCCESSFULLY;
+                                else
+                                    reply = Notification.UNSUCCESSFULLY;
+                                socketObjectWriter.writeObject(reply);
+                                System.out.println("> Ответ: " + reply);
+                            }
                             break;
                         case GET_GOODS:
-                            socketObjectWriter.writeObject(WarehouseUnitDAO.getAll());
+                            socketObjectWriter.writeObject(new WarehouseUnitDAOImpl().getAll());
                             break;
                         case GET_RESERVES:
-                            socketObjectWriter.writeObject(ReserveUnitDAO.getClientReserves(clientDTO));
+                            if (clientDTO == null) {
+                                socketObjectWriter.writeObject(Notification.UNAUTHORIZED);
+                                System.out.println("> Клиент " + socket + " не авторизован");
+                            }
+                            else {
+                                socketObjectWriter.writeObject(Notification.DEFAULT);
+                                socketObjectWriter.writeObject(new ReserveUnitDAOImpl().getClientReserves(clientDTO));
+                            }
                             break;
                         case DISCONNECT:
                             Thread.currentThread().interrupt();
@@ -229,7 +267,7 @@ public class ConnectionHandler extends Thread {
                                 break;
                             }
                         if (token == null) {
-                            token = new Token(WarehouseUnitDAO.getById(((ReserveUnitDTO) i).getWarehouseUnit().getId()));
+                            token = new Token(new WarehouseUnitDAOImpl().getById(((ReserveUnitDTO) i).getWarehouseUnit().getId()));
                             tokens.add(token);
                         }
                     }
@@ -263,13 +301,13 @@ public class ConnectionHandler extends Thread {
                             break;
                         }
                     if (token == null) {
-                        token = new Token(WarehouseUnitDAO.getById(reserveUnitDTO.getWarehouseUnit().getId()));
+                        token = new Token(new WarehouseUnitDAOImpl().getById(reserveUnitDTO.getWarehouseUnit().getId()));
                         tokens.add(token);
                     }
                 }
                 token.acquire();
                 token.getWarehouseUnit().setAmount(token.getWarehouseUnit().getAmount() + reserveUnitDTO.getAmount());
-                ReserveUnitDAO.delete(reserveUnitDTO);
+                new ReserveUnitDAOImpl().delete(reserveUnitDTO);
                 token.release();
             }
             catch (InterruptedException exception) {
@@ -312,8 +350,9 @@ public class ConnectionHandler extends Thread {
 
         private Notification register(ClientDTO clientDTO) {
             Notification notification;
-            if (ClientDAO.isLoginOccupy(clientDTO)) {
-                ClientDAO.insert(clientDTO);
+            ClientDAOImpl clientDAO = new ClientDAOImpl();
+            if (clientDAO.isLoginOccupy(clientDTO)) {
+                clientDAO.insert(clientDTO);
                 notification = Notification.SUCCESSFULLY;
             }
             else {
@@ -323,14 +362,18 @@ public class ConnectionHandler extends Thread {
         }
 
         private Notification auth(ClientDTO clientDTO) {
-            if (ClientDAO.isLoginPassPairValid(clientDTO))
+            ClientDTO authResult = new ClientDAOImpl().getByLoginAndPass(clientDTO);
+            if (authResult != null) {
+                this.clientDTO = authResult;
                 return Notification.SUCCESSFULLY;
+            }
             else
                 return Notification.UNSUCCESSFULLY;
         }
     }
 
     private static class Token extends Semaphore {
+        private static int validTokenCounter = 0;
         private boolean isAutoFlushing = false;
         private WarehouseUnitDTO warehouseUnit;
         private int usingCounter = 1;
@@ -338,6 +381,7 @@ public class ConnectionHandler extends Thread {
         Token(WarehouseUnitDTO warehouseUnit) {
             super(1);
             this.warehouseUnit = warehouseUnit;
+            ++validTokenCounter;
         }
 
         synchronized void incrementUsingCounter() {
@@ -346,8 +390,14 @@ public class ConnectionHandler extends Thread {
 
         synchronized void decrementUsingCounter() {
             --usingCounter;
-            if (isAutoFlushing && usingCounter <= 0)
-                WarehouseUnitDAO.update(warehouseUnit);
+            if (isAutoFlushing) {
+                if (usingCounter <= 0) {
+                    new WarehouseUnitDAOImpl().update(warehouseUnit);
+                    --validTokenCounter;
+                }
+                if (validTokenCounter <= 0)
+                    SessionProvider.shutdown();
+            }
         }
 
         synchronized boolean isValid() {

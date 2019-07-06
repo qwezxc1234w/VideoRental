@@ -1,6 +1,7 @@
 package com.scarawooo.client.view;
 
 import com.scarawooo.client.factories.PostmenFactory;
+import com.scarawooo.client.view.dialogs.LoginDialog;
 import com.scarawooo.service.Notification;
 
 import javax.swing.*;
@@ -20,7 +21,8 @@ public class Content extends JFrame {
     private JTabbedPane tabs = new JTabbedPane();
 
     public Content() {
-        super(title);
+        super();
+        updateTitle();
         setJMenuBar(managementMenu);
         setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
         setBounds(400, 10, WIDTH, HEIGHT);
@@ -63,5 +65,9 @@ public class Content extends JFrame {
 
     public Reserves getReserves() {
         return reserves;
+    }
+
+    public void updateTitle() {
+        setTitle(title + " | Login: " + (LoginDialog.getLoginData() == null ? null : LoginDialog.getLoginData().getLogin()));
     }
 }
